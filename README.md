@@ -6,7 +6,7 @@ This version keeps the original CARD training workflow while removing unused cod
 
 ```bash
 uv venv -p 3.12
-uv pip install torch==2.11.0 torch_geometric scikit-learn --torch-backend=cu128
+uv pip install torch==2.11.0 torch_geometric scikit-learn optuna pandas --torch-backend=cu128
 ```
 
 ## Usage
