@@ -1,1 +1,0 @@
-this is directory that save model pkl

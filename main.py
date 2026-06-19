@@ -9,10 +9,8 @@ from utils import *
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import MinMaxScaler
-from pygod.metrics import eval_recall_at_k, eval_precision_at_k
 import random
 import os
-import dgl
 from pygod.utils import load_data
 from torch_geometric.utils import to_dense_adj
 import argparse
@@ -59,6 +57,7 @@ parser.add_argument('--beta', type=float)
 parser.add_argument('--modelMode', type=str, default='gpu')
 parser.add_argument('--IsSwap', type=bool, default=False)
 parser.add_argument('--m', type=int)
+parser.add_argument('--device', type=str, default=None, help='e.g. cuda:0, cuda:1 or cpu')
 args = parser.parse_args()
 
 
@@ -91,11 +90,11 @@ print('Dataset: ', args.dataset)
 print(args.gama, args.beta)
 
 
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+device = torch.device(args.device if args.device is not None else ('cuda:0' if torch.cuda.is_available() else 'cpu'))
 
 # device = torch.device('cpu')
 # Set random seed
-dgl.random.seed(args.seed)
+# DGL removed: RWR now uses Python random, NumPy and PyTorch seeds below.
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
@@ -117,7 +116,7 @@ diff = np.load('./diff/diff_A_' + args.dataset + '.npy', allow_pickle=True)
 
 b_adj = sp.csr_matrix(diff)
 b_adj = (b_adj + sp.eye(b_adj.shape[0])).todense()
-dgl_graph = adj_to_dgl_graph(adj)
+pyg_graph = adj_to_pyg_graph(None, adj)
 raw_feature = features.todense()
 features, _ = preprocess_features(features)
 
@@ -129,7 +128,7 @@ c_features = features
 c_features = torch.FloatTensor(c_features)
 c_adj = adj.todense()
 c_adj = torch.FloatTensor(c_adj).to(device)
-c_features = rand_prop(features=c_features, dropnode_rate=0.5, A=c_adj, order=5, cuda=1)
+c_features = rand_prop(features=c_features, dropnode_rate=0.5, A=c_adj, order=5, device=device)
 
 c_features_pyg = adj_to_pyg_graph(c_features, c_adj)
 print('unleash the memory')
@@ -162,7 +161,7 @@ if torch.cuda.is_available():
     c_features = c_features.to(device)
     B = B.to(device)
     if args.IsSwap:
-        c_features_pyg = c_features_pyg.cuda(1)
+        c_features_pyg = c_features_pyg.to(device)
     else:
         c_features_pyg = c_features_pyg.to(device)
 
@@ -201,7 +200,7 @@ with tqdm(total=args.num_epoch) as pbar:
 
         random.shuffle(all_idx)
         total_loss = 0.
-        subgraphs = generate_rwr_subgraph(dgl_graph, subgraph_size)
+        subgraphs = generate_rwr_subgraph(pyg_graph, subgraph_size)
         p = 0
         i = 0
         Flag = False
@@ -342,8 +341,6 @@ with tqdm(total=args.num_epoch) as pbar:
                 ano_scores = ano_score_co + args.gama * score_re
                 final_test_score = score_global_re
                 test_auc = roc_auc_score(ano_label, final_test_score)
-                print('previous auc is', best_auc)
-                print('test_auc is ', test_auc)
                 if test_auc > best_auc:
                     best_auc = test_auc
                 else:
@@ -360,8 +357,7 @@ with tqdm(total=args.num_epoch) as pbar:
             best = mean_loss
             best_t = epoch
             cnt_wait = 0
-            torch.save(model.state_dict(),
-                        './model/' + args.dataset + '_best_model'+ str(args.gama) + '_' + str(args.beta) + '_.pkl')  # multi_round_ano_score_p[round, idx] = ano_score_p
+            torch.save(model.state_dict(), 'best.pkl')  # multi_round_ano_score_p[round, idx] = ano_score_p
 
         else:
             cnt_wait += 1
@@ -373,7 +369,7 @@ with tqdm(total=args.num_epoch) as pbar:
 print('testing_' + args.dataset)
 print('Loading {}th epoch from the training'.format(best_t))
 
-model.load_state_dict(torch.load('./model/' + args.dataset + '_best_model'+ str(args.gama) + '_' + str(args.beta) + '_.pkl'))
+model.load_state_dict(torch.load('best.pkl'))
 
 multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes))
 multi_round_ano_score_p = np.zeros((args.auc_test_rounds, nb_nodes))
@@ -388,7 +384,7 @@ with tqdm(total=args.auc_test_rounds) as pbar_test:
         all_idx = list(range(nb_nodes))
         random.shuffle(all_idx)
 
-        subgraphs = generate_rwr_subgraph(dgl_graph, subgraph_size)
+        subgraphs = generate_rwr_subgraph(pyg_graph, subgraph_size)
         for batch_idx in range(batch_num):
 
             optimiser.zero_grad()
@@ -492,9 +488,3 @@ resultList  = []
 ano_score_final = (1 - args.beta) * np.mean(multi_round_ano_score, axis=0) + args.beta * np.mean(multi_round_ano_score_global, axis=0)
 auc = roc_auc_score(ano_label, ano_score_final)
 print('the auc is ', auc)
-pre_100 = eval_precision_at_k(ano_label, ano_score_final, 100)
-pre_200 = eval_precision_at_k(ano_label, ano_score_final, 200)
-
-resultList.append(pre_100)
-resultList.append(pre_200)
-print('the precision at 100 and 200', resultList)
