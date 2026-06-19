@@ -1,13 +1,20 @@
 import random
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
-import networkx as nx
 import numpy as np
-import scipy.io as sio
 import scipy.sparse as sp
 import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import from_scipy_sparse_matrix, to_undirected
+
+from card_data import (
+    DEFAULT_DATA_ROOT,
+    get_adj_from_mat,
+    get_anomaly_label_from_mat,
+    get_class_from_mat,
+    get_features_from_mat,
+    load_raw_mat,
+)
 
 
 def sparse_to_tuple(sparse_mx, insert_batch=False):
@@ -52,31 +59,35 @@ def normalize_adj(adj):
 
 def dense_to_one_hot(labels_dense, num_classes):
     """Convert class labels from scalars to one-hot vectors."""
+    labels_dense = np.squeeze(np.asarray(labels_dense, dtype=np.int64))
     num_labels = labels_dense.shape[0]
     index_offset = np.arange(num_labels) * num_classes
-    labels_one_hot = np.zeros((num_labels, num_classes))
+    labels_one_hot = np.zeros((num_labels, num_classes), dtype=np.float32)
     labels_one_hot.flat[index_offset + labels_dense.ravel()] = 1
     return labels_one_hot
 
 
-def load_mat(dataset, train_rate=0.3, val_rate=0.1):
-    """Load .mat dataset."""
-    data = sio.loadmat("./dataset/{}.mat".format(dataset))
-    label = data["Label"] if ("Label" in data) else data["gnd"]
-    attr = data["Attributes"] if ("Attributes" in data) else data["X"]
-    network = data["Network"] if ("Network" in data) else data["A"]
+def load_mat(dataset, train_rate=0.3, val_rate=0.1, data_root=DEFAULT_DATA_ROOT):
+    """Load `.mat` dataset from ~/datasets/GAD/mat by default.
 
-    adj = sp.csr_matrix(network)
-    feat = sp.lil_matrix(attr)
+    Supported keys:
+      adjacency: Network / A / adj / Adj
+      features:  Attributes / X / attr / features
+      anomaly labels: Label / gnd / y / anomaly_label
+      class labels: Class / class / labels, optional
+    """
+    data = load_raw_mat(dataset, data_root=data_root)
+    adj = get_adj_from_mat(data)
+    feat = get_features_from_mat(data)
+    ano_labels = get_anomaly_label_from_mat(data)
 
-    labels = np.squeeze(np.array(data["Class"], dtype=np.int64) - 1)
-    num_classes = np.max(labels) + 1
-    labels = dense_to_one_hot(labels, num_classes)
-    ano_labels = np.squeeze(np.array(label))
+    class_labels = get_class_from_mat(data, adj.shape[0])
+    num_classes = int(np.max(class_labels)) + 1 if class_labels.size else 1
+    labels = dense_to_one_hot(class_labels, max(num_classes, 1))
 
     if "str_anomaly_label" in data:
-        str_ano_labels = np.squeeze(np.array(data["str_anomaly_label"]))
-        attr_ano_labels = np.squeeze(np.array(data["attr_anomaly_label"]))
+        str_ano_labels = np.squeeze(np.asarray(data["str_anomaly_label"]))
+        attr_ano_labels = np.squeeze(np.asarray(data["attr_anomaly_label"]))
     else:
         str_ano_labels = None
         attr_ano_labels = None
@@ -93,49 +104,13 @@ def load_mat(dataset, train_rate=0.3, val_rate=0.1):
     return adj, feat, labels, idx_train, idx_val, idx_test, ano_labels, str_ano_labels, attr_ano_labels
 
 
-def load_mat_amazon(dataset, train_rate=0.3, val_rate=0.1):
-    """Load .mat dataset without class labels."""
-    data = sio.loadmat("./dataset/{}.mat".format(dataset))
-    label = data["Label"] if ("Label" in data) else data["gnd"]
-    attr = data["Attributes"] if ("Attributes" in data) else data["X"]
-    network = data["Network"] if ("Network" in data) else data["A"]
-
-    adj = sp.csr_matrix(network)
-    feat = sp.lil_matrix(attr)
-    labels = [0]
-    ano_labels = np.squeeze(np.array(label))
-
-    if "str_anomaly_label" in data:
-        str_ano_labels = np.squeeze(np.array(data["str_anomaly_label"]))
-        attr_ano_labels = np.squeeze(np.array(data["attr_anomaly_label"]))
-    else:
-        str_ano_labels = None
-        attr_ano_labels = None
-
-    num_node = adj.shape[0]
-    num_train = int(num_node * train_rate)
-    num_val = int(num_node * val_rate)
-    all_idx = list(range(num_node))
-    random.shuffle(all_idx)
-    idx_train = all_idx[:num_train]
-    idx_val = all_idx[num_train:num_train + num_val]
-    idx_test = all_idx[num_train + num_val:]
-
-    return adj, feat, labels, idx_train, idx_val, idx_test, ano_labels, str_ano_labels, attr_ano_labels
+def load_mat_amazon(dataset, train_rate=0.3, val_rate=0.1, data_root=DEFAULT_DATA_ROOT):
+    """Backward-compatible alias; now also loads from data_root."""
+    return load_mat(dataset, train_rate=train_rate, val_rate=val_rate, data_root=data_root)
 
 
 def adj_to_pyg_graph(x=None, adj=None) -> Data:
-    """Convert a scipy/numpy/torch adjacency matrix into a PyG Data graph.
-
-    Parameters
-    ----------
-    x:
-        Optional node feature tensor. The original CARD code also calls this helper
-        only to move a feature graph onto a device, so x can be None.
-    adj:
-        scipy sparse matrix, numpy dense matrix, or torch dense/sparse adjacency.
-    """
-    # Backward compatible form: adj_to_pyg_graph(adj)
+    """Convert a scipy/numpy/torch adjacency matrix into a PyG Data graph."""
     if adj is None:
         adj = x
         x = None
@@ -150,13 +125,13 @@ def adj_to_pyg_graph(x=None, adj=None) -> Data:
             edge_index = coalesced.indices().long().cpu()
             edge_weight = coalesced.values().float().cpu()
         else:
-            edge_index = adj.detach().to_sparse().indices().long().cpu()
-            edge_weight = adj.detach().to_sparse().values().float().cpu()
+            sparse_adj = adj.detach().to_sparse()
+            edge_index = sparse_adj.indices().long().cpu()
+            edge_weight = sparse_adj.values().float().cpu()
     else:
         adj = np.asarray(adj)
         num_nodes = adj.shape[0]
-        adj_sp = sp.coo_matrix(adj)
-        edge_index, edge_weight = from_scipy_sparse_matrix(adj_sp)
+        edge_index, edge_weight = from_scipy_sparse_matrix(sp.coo_matrix(adj))
 
     edge_index, edge_weight = to_undirected(edge_index, edge_attr=edge_weight, num_nodes=num_nodes, reduce="mean")
     if x is not None and not torch.is_tensor(x):
@@ -165,22 +140,16 @@ def adj_to_pyg_graph(x=None, adj=None) -> Data:
 
 
 def adj_to_dgl_graph(adj) -> Data:
-    """Compatibility alias.
-
-    The old CARD code called adj_to_dgl_graph(adj) before RWR sampling.  To keep
-    old call sites working while removing DGL, this function now returns a PyG
-    Data object instead of a DGLGraph.
-    """
+    """Compatibility alias: returns PyG Data instead of a DGLGraph."""
     return adj_to_pyg_graph(None, adj)
 
 
 def adj_to_dgl_graph_tensor(adj) -> Data:
-    """Compatibility alias for tensor adjacency input; now returns a PyG Data object."""
+    """Compatibility alias for tensor adjacency input; returns PyG Data."""
     return adj_to_pyg_graph(None, adj)
 
 
 def _build_neighbor_lists(graph: Data) -> List[List[int]]:
-    """Build and cache CPU adjacency lists from a PyG graph."""
     cached = getattr(graph, "_card_neighbor_lists", None)
     if cached is not None:
         return cached
@@ -188,16 +157,11 @@ def _build_neighbor_lists(graph: Data) -> List[List[int]]:
     edge_index = graph.edge_index.detach().cpu().long()
     num_nodes = int(graph.num_nodes)
     neighbors: List[List[int]] = [[] for _ in range(num_nodes)]
-
     if edge_index.numel() > 0:
-        src = edge_index[0].tolist()
-        dst = edge_index[1].tolist()
-        for u, v in zip(src, dst):
+        for u, v in zip(edge_index[0].tolist(), edge_index[1].tolist()):
             if 0 <= u < num_nodes and 0 <= v < num_nodes:
                 neighbors[u].append(v)
 
-    # Remove duplicates while preserving insertion order. This also reduces the
-    # sampling bias introduced by duplicated symmetric edges.
     for i, neigh in enumerate(neighbors):
         seen = set()
         compact = []
@@ -223,16 +187,8 @@ def _ordered_unique(nodes: Sequence[int]) -> List[int]:
 
 
 def _rwr_trace(neighbors: List[List[int]], seed: int, restart_prob: float, max_nodes_per_seed: int) -> List[int]:
-    """Random-walk-with-restart trace implemented with Python/PyTorch-free logic.
-
-    It intentionally follows the old DGL usage pattern: the trace starts from the
-    seed, may revisit the seed via restart, and the caller later keeps ordered
-    unique nodes. Randomness comes from Python's random module, which is already
-    seeded in main.py.
-    """
     if max_nodes_per_seed <= 0:
         return [seed]
-
     cur = int(seed)
     trace = []
     for _ in range(max_nodes_per_seed):
@@ -259,11 +215,7 @@ def _pad_or_cut(nodes: List[int], seed: int, reduced_size: int) -> List[int]:
 
 
 def generate_rwr_subgraph(pyg_graph: Data, subgraph_size: int):
-    """Generate CARD subgraphs with RWR using PyG Data instead of DGL.
-
-    Output format is kept identical to the original implementation: each entry is
-    a list of length subgraph_size, where the last element is the center node.
-    """
+    """Generate CARD subgraphs with RWR using PyG Data instead of DGL."""
     neighbors = _build_neighbor_lists(pyg_graph)
     num_nodes = int(pyg_graph.num_nodes)
     reduced_size = subgraph_size - 1
@@ -287,10 +239,7 @@ def generate_rwr_subgraph(pyg_graph: Data, subgraph_size: int):
 
 
 def generate_rwr_subgraph_test(pyg_graph: Data, subgraph_size: int, adj, meanDegree):
-    """Test-time RWR sampler, DGL-free PyG version.
-
-    Preserves the fallback degree-based sampling logic from the old code.
-    """
+    """Test-time RWR sampler, DGL-free PyG version."""
     neighbors = _build_neighbor_lists(pyg_graph)
     num_nodes = int(pyg_graph.num_nodes)
     reduced_size = subgraph_size - 1
@@ -318,23 +267,14 @@ def generate_rwr_subgraph_test(pyg_graph: Data, subgraph_size: int, adj, meanDeg
             degree = torch.sum(adj[node, :]) + torch.sum(adj[:, node])
             degree_list[int(node)] = degree
 
-        if len(nodes) < subgraph_size * 2:
-            rank_list = sorted(degree_list.items(), key=lambda x: x[1], reverse=True)[:len(nodes)]
-        else:
-            rank_list = sorted(degree_list.items(), key=lambda x: x[1], reverse=True)[:subgraph_size * 2]
-
-        choose_list = [int(item[0]) for item in rank_list]
-        if len(choose_list) == 0:
-            choose_list = [seed]
+        rank_limit = len(nodes) if len(nodes) < subgraph_size * 2 else subgraph_size * 2
+        rank_list = sorted(degree_list.items(), key=lambda x: x[1], reverse=True)[:rank_limit]
+        choose_list = [int(item[0]) for item in rank_list] or [seed]
 
         tmp = []
-        if len(nodes) < subgraph_size * 2:
-            for _ in range(reduced_size):
-                tmp.append(choose_list[random.randint(0, len(choose_list) - 1)])
-        else:
-            upper = min(subgraph_size * 2, len(choose_list)) - 1
-            for _ in range(reduced_size):
-                tmp.append(choose_list[random.randint(0, upper)])
+        upper = len(choose_list) - 1 if len(nodes) < subgraph_size * 2 else min(subgraph_size * 2, len(choose_list)) - 1
+        for _ in range(reduced_size):
+            tmp.append(choose_list[random.randint(0, upper)])
         tmp.append(seed)
         subgraphs.append(tmp)
     return subgraphs

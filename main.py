@@ -6,6 +6,7 @@ import torch.nn as nn
 from aug import *
 from model import *
 from utils import *
+from card_data import ensure_dataset_artifacts, load_edgelist_dense, load_diff_csr
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import MinMaxScaler
@@ -57,6 +58,11 @@ parser.add_argument('--beta', type=float)
 parser.add_argument('--modelMode', type=str, default='gpu')
 parser.add_argument('--IsSwap', type=bool, default=False)
 parser.add_argument('--m', type=int)
+parser.add_argument('--data_root', type=str, default='~/datasets/GAD/mat', help='Directory containing {dataset}.mat files')
+parser.add_argument('--artifact_root', type=str, default='.', help='Where edgelist/ and diff/ are stored')
+parser.add_argument('--force_preprocess', action='store_true', help='Regenerate edgelist and diff_A even if they already exist')
+parser.add_argument('--gdc_alpha', type=float, default=0.01, help='GDC alpha for diff_A generation')
+parser.add_argument('--gdc_eps', type=float, default=0.0001, help='GDC epsilon threshold for diff_A generation')
 parser.add_argument('--device', type=str, default=None, help='e.g. cuda:0, cuda:1 or cpu')
 args = parser.parse_args()
 
@@ -65,16 +71,27 @@ if args.lr is None:
     args.lr = 1e-3
 
 if args.num_epoch is None:
-    if args.dataset in ['cora', 'citeseer', 'pubmed', 'dblp', 'citation','reddit','books']:
-        args.num_epoch = 100
-    elif args.dataset in ['ACM','Flickr']:
+    args.num_epoch = 100
+    if args.dataset in ['ACM', 'Flickr']:
         args.num_epoch = 400
 
-print("reading edgelist")
-normal_adj = load_edgelist('./edgelist/' + args.dataset + '.edgelist')
+print("checking edgelist and diff_A")
 
+artifact_info = ensure_dataset_artifacts(
+    args.dataset,
+    data_root=args.data_root,
+    artifact_root=args.artifact_root,
+    alpha=args.gdc_alpha,
+    eps=args.gdc_eps,
+    force=args.force_preprocess,
+)
 
-args.m = m_dic[args.dataset]
+normal_adj = load_edgelist_dense(
+    artifact_info["edgelist_path"],
+    num_nodes=artifact_info["num_nodes"],
+)
+
+args.m = artifact_info["num_edges"]
 
 k1 = np.sum(normal_adj, axis=1)
 k2 = k1.reshape(normal_adj.shape[0], 1)
@@ -106,15 +123,12 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 # Load and preprocess data
-if args.dataset in ['reddit','books']:
-    adj, features, ano_label = get_ground_truthDataset(args.dataset)
-else:
-    adj, features, labels, idx_train, idx_val, \
-    idx_test, ano_label, str_ano_label, attr_ano_label = load_mat(args.dataset)
+adj, features, labels, idx_train, idx_val, idx_test, ano_label, str_ano_label, attr_ano_label = load_mat(
+    args.dataset,
+    data_root=args.data_root,
+)
 
-diff = np.load('./diff/diff_A_' + args.dataset + '.npy', allow_pickle=True)
-
-b_adj = sp.csr_matrix(diff)
+b_adj = load_diff_csr(artifact_info["diff_path"])
 b_adj = (b_adj + sp.eye(b_adj.shape[0])).todense()
 pyg_graph = adj_to_pyg_graph(None, adj)
 raw_feature = features.todense()
@@ -129,7 +143,6 @@ c_features = torch.FloatTensor(c_features)
 c_adj = adj.todense()
 c_adj = torch.FloatTensor(c_adj).to(device)
 c_features = rand_prop(features=c_features, dropnode_rate=0.5, A=c_adj, order=5, device=device)
-
 c_features_pyg = adj_to_pyg_graph(c_features, c_adj)
 print('unleash the memory')
 c_features = c_features.cpu()

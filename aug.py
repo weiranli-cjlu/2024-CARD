@@ -3,20 +3,22 @@ import scipy.io as sio
 import scipy.sparse as sp
 import torch
 
-from utils import load_mat
+from card_data import DEFAULT_DATA_ROOT, get_adj_from_mat, load_raw_mat
 
 
 # This is used to generate the diffusion view, which outputs a matrix.
 def gdc(A: sp.csr_matrix, alpha: float, eps: float):
     N = A.shape[0]
-    A_loop = sp.eye(N) + A
+    A_loop = sp.eye(N, format="csr") + A
     D_loop_vec = A_loop.sum(0).A1
     D_loop_vec_invsqrt = 1 / np.sqrt(D_loop_vec)
+    D_loop_vec_invsqrt[np.isinf(D_loop_vec_invsqrt)] = 0.0
     D_loop_invsqrt = sp.diags(D_loop_vec_invsqrt)
     T_sym = D_loop_invsqrt @ A_loop @ D_loop_invsqrt
-    S = alpha * sp.linalg.inv(sp.eye(N) - (1 - alpha) * T_sym)
+    S = alpha * sp.linalg.inv(sp.eye(N, format="csr") - (1 - alpha) * T_sym)
     S_tilde = S.multiply(S >= eps)
     D_tilde_vec = S_tilde.sum(0).A1
+    D_tilde_vec[D_tilde_vec == 0] = 1.0
     T_S = S_tilde / D_tilde_vec
     return T_S
 
@@ -24,11 +26,11 @@ def gdc(A: sp.csr_matrix, alpha: float, eps: float):
 datasets = ["pubmed", "Flickr"]
 
 
-def gen():
+def gen(data_root=DEFAULT_DATA_ROOT):
     for name in datasets:
         print("loading dataset: ", name)
-        data = sio.loadmat("./dataset/{}.mat".format(name))
-        adj = data["Network"] if ("Network" in data) else data["A"]
+        data = load_raw_mat(name, data_root=data_root)
+        adj = get_adj_from_mat(data)
         print("generating dataset", name)
         diff = gdc(adj, alpha=0.01, eps=0.0001)
         np.save("./diff/diff_A_" + name, diff)
@@ -55,12 +57,7 @@ def _resolve_device(device=None, cuda=None):
 
 
 def rand_prop(features, dropnode_rate, A, order, cuda=None, device=None):
-    """Random propagation without hard-coded cuda:1.
-
-    The original implementation used masks.cuda(cuda) and features.cuda(cuda),
-    which breaks on machines with only one GPU and is inconvenient on RTX 50xx
-    setups. Pass device from main.py instead.
-    """
+    """Random propagation without hard-coded cuda:1."""
     device = _resolve_device(device=device, cuda=cuda)
     features = features.to(device)
     A = A.to(device)
