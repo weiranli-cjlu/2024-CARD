@@ -1,503 +1,353 @@
+import argparse
+import os
+import random
+from pathlib import Path
+
 import numpy as np
-from numpy.core.fromnumeric import shape
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
-from aug import *
-from model import *
-from utils import *
-from card_data import ensure_dataset_artifacts, load_edgelist_dense, load_diff_csr
-from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.preprocessing import MinMaxScaler
-import random
-import os
-from pygod.utils import load_data
-from torch_geometric.utils import to_dense_adj
-import argparse
+import torch.nn.functional as F
+from sklearn.metrics import auc as sklearn_auc
+from sklearn.metrics import precision_recall_curve, roc_auc_score
 from tqdm import tqdm
+
+from aug import rand_prop
+from card_data import ensure_dataset_artifacts, load_diff_csr, load_edgelist_dense
+from model import Model
+from utils import adj_to_pyg_graph, generate_rwr_subgraph, load_mat, normalize_adj, preprocess_features
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-def load_edgelist(file):
-    network = nx.read_weighted_edgelist(file)
-    A = np.asarray(nx.adjacency_matrix(network, nodelist=None, weight='None').todense())
-    x = A
-    return x
 
-m_dic = {'cora': 5429,'Amazon':3695, 'Flickr':239738, 'disney':335, 'citeseer': 4732, 'pubmed': 44338, 'BlogCatalog': 171743, 'ACM': 71980, 'dblp': 8817, 'citation': 15098, 'citation_20':15098, 'dblp_20':8817,'weibo':407963,'reddit':168016, 'books':3695}
-
-def get_ground_truthDataset(dataset,cache=None):
-    data = load_data(dataset,cache_dir=cache)
-    adj = to_dense_adj(data.edge_index)[0]
-    adj = sp.csr_matrix(adj)
-    feat = data.x
-    feat = sp.lil_matrix(feat)
-    label = np.array(data.y)
-    return adj, feat, label
-
-parser = argparse.ArgumentParser(description='''CARD:Community-Guided Contrastive Learning with
-                                                Anomaly-Aware Reconstruction for Attributed Networks
-                                                                                Anomaly Detection''')
-parser.add_argument('--dataset', type=str, default='cora')
-parser.add_argument('--lr', type=float)
-parser.add_argument('--weight_decay', type=float, default=0.0)
-parser.add_argument('--seed', type=int, default=2)
-parser.add_argument('--embedding_dim', type=int, default=64)
-parser.add_argument('--num_epoch', type=int)
-parser.add_argument('--drop_prob', type=float, default=0.0)
-parser.add_argument('--batch_size', type=int, default=300)
-parser.add_argument('--subgraph_size', type=int, default=4)
-parser.add_argument('--readout', type=str, default='avg')  
-parser.add_argument('--auc_test_rounds', type=int, default=150)
-parser.add_argument('--negsamp_ratio', type=int, default=1)
-parser.add_argument('--dropout', type=float, default=0.5)
-parser.add_argument('--earlystop', type=bool, default=True)
-parser.add_argument('--gama', type=float)
-parser.add_argument('--beta', type=float)
-parser.add_argument('--modelMode', type=str, default='gpu')
-parser.add_argument('--IsSwap', type=bool, default=False)
-parser.add_argument('--m', type=int)
-parser.add_argument('--data_root', type=str, default='~/datasets/GAD/mat', help='Directory containing {dataset}.mat files')
-parser.add_argument('--artifact_root', type=str, default='.', help='Where edgelist/ and diff/ are stored')
-parser.add_argument('--force_preprocess', action='store_true', help='Regenerate edgelist and diff_A even if they already exist')
-parser.add_argument('--gdc_alpha', type=float, default=0.01, help='GDC alpha for diff_A generation')
-parser.add_argument('--gdc_eps', type=float, default=0.0001, help='GDC epsilon threshold for diff_A generation')
-parser.add_argument('--device', type=str, default=None, help='e.g. cuda:0, cuda:1 or cpu')
-args = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "CARD: Community-Guided Contrastive Learning with Anomaly-Aware "
+            "Reconstruction for Attributed Network Anomaly Detection"
+        )
+    )
+    parser.add_argument("--dataset", type=str, default="cora")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--embedding_dim", type=int, default=64)
+    parser.add_argument("--num_epoch", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=300)
+    parser.add_argument("--subgraph_size", type=int, default=4)
+    parser.add_argument("--readout", type=str, default="avg")
+    parser.add_argument("--auc_test_rounds", type=int, default=150)
+    parser.add_argument("--negsamp_ratio", type=int, default=1)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--earlystop", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gama", type=float, required=True)
+    parser.add_argument("--beta", type=float, required=True)
+    parser.add_argument("--data_root", type=str, default="~/datasets/GAD/mat", help="Directory containing {dataset}.mat files")
+    parser.add_argument("--artifact_root", type=str, default=".", help="Where edgelist/ and diff/ are stored")
+    parser.add_argument("--force_preprocess", action="store_true", help="Regenerate edgelist and diff_A even if they already exist")
+    parser.add_argument("--gdc_alpha", type=float, default=0.01, help="GDC alpha for diff_A generation")
+    parser.add_argument("--gdc_eps", type=float, default=0.0001, help="GDC epsilon threshold for diff_A generation")
+    parser.add_argument("--device", type=str, default=None, help="e.g. cuda:0, cuda:1 or cpu")
+    parser.add_argument("--checkpoint", type=str, default="best.pkl")
+    return parser.parse_args()
 
 
-if args.lr is None:
-    args.lr = 1e-3
-
-if args.num_epoch is None:
-    args.num_epoch = 100
-    if args.dataset in ['ACM', 'Flickr']:
-        args.num_epoch = 400
-
-print("checking edgelist and diff_A")
-
-artifact_info = ensure_dataset_artifacts(
-    args.dataset,
-    data_root=args.data_root,
-    artifact_root=args.artifact_root,
-    alpha=args.gdc_alpha,
-    eps=args.gdc_eps,
-    force=args.force_preprocess,
-)
-
-normal_adj = load_edgelist_dense(
-    artifact_info["edgelist_path"],
-    num_nodes=artifact_info["num_nodes"],
-)
-
-args.m = artifact_info["num_edges"]
-
-k1 = np.sum(normal_adj, axis=1)
-k2 = k1.reshape(normal_adj.shape[0], 1)
-k1k2 = k1 * k2
-eij = k1k2 / (2 * args.m)
-B = np.array(normal_adj - eij)
-if args.dataset in ['ACM','pubmed']:
-    args.batch_size = 500
-batch_size = args.batch_size
-subgraph_size = args.subgraph_size
-print('Dataset: ', args.dataset)
-
-print(args.gama, args.beta)
+def set_seed(seed: int) -> None:
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-device = torch.device(args.device if args.device is not None else ('cuda:0' if torch.cuda.is_available() else 'cpu'))
+def minmax_scale_np(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    v_min = values.min()
+    v_max = values.max()
+    denom = v_max - v_min
+    if denom <= 1e-12:
+        return np.zeros_like(values)
+    return (values - v_min) / denom
 
-# device = torch.device('cpu')
-# Set random seed
-# DGL removed: RWR now uses Python random, NumPy and PyTorch seeds below.
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-torch.cuda.manual_seed(args.seed)
-torch.cuda.manual_seed_all(args.seed)
-random.seed(args.seed)
-os.environ['PYTHONHASHSEED'] = str(args.seed)
-os.environ['OMP_NUM_THREADS'] = '1'
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
-# Load and preprocess data
-adj, features, labels, idx_train, idx_val, idx_test, ano_label, str_ano_label, attr_ano_label = load_mat(
-    args.dataset,
-    data_root=args.data_root,
-)
+def compute_metrics(labels: np.ndarray, scores: np.ndarray):
+    labels = np.asarray(labels).reshape(-1).astype(np.int64)
+    scores = np.asarray(scores).reshape(-1)
+    roc_auc = roc_auc_score(labels, scores)
+    precision, recall, _ = precision_recall_curve(labels, scores)
+    auprc = sklearn_auc(recall, precision)
+    return roc_auc, auprc
 
-b_adj = load_diff_csr(artifact_info["diff_path"])
-b_adj = (b_adj + sp.eye(b_adj.shape[0])).todense()
-pyg_graph = adj_to_pyg_graph(None, adj)
-raw_feature = features.todense()
-features, _ = preprocess_features(features)
 
-nb_nodes = features.shape[0]
-ft_size = features.shape[1]
+def iter_batches(num_nodes: int, batch_size: int, shuffle: bool = True):
+    indices = np.arange(num_nodes)
+    if shuffle:
+        np.random.shuffle(indices)
+    for start in range(0, num_nodes, batch_size):
+        yield indices[start:start + batch_size]
 
-c_features = features
 
-c_features = torch.FloatTensor(c_features)
-c_adj = adj.todense()
-c_adj = torch.FloatTensor(c_adj).to(device)
-c_features = rand_prop(features=c_features, dropnode_rate=0.5, A=c_adj, order=5, device=device)
-c_features_pyg = adj_to_pyg_graph(c_features, c_adj)
-print('unleash the memory')
-c_features = c_features.cpu()
-torch.cuda.empty_cache()  # 释放显存
+def gather_square_matrix(matrix: torch.Tensor, nodes: torch.Tensor) -> torch.Tensor:
+    """Batch gather matrix[nodes, nodes]."""
+    batch_size, subgraph_size = nodes.shape
+    rows = matrix.index_select(0, nodes.reshape(-1)).reshape(batch_size, subgraph_size, -1)
+    return rows.gather(2, nodes.unsqueeze(1).expand(-1, subgraph_size, -1))
 
-adj = normalize_adj(adj)
-adj = (adj + sp.eye(adj.shape[0])).todense()
-c_adj = adj
-features = torch.FloatTensor(features[np.newaxis])
-raw_feature = torch.FloatTensor(raw_feature[np.newaxis])
 
-adj = torch.FloatTensor(adj[np.newaxis])
-b_adj = torch.FloatTensor(b_adj[np.newaxis])
-B = torch.FloatTensor(B[np.newaxis])
-alpha = 0.1
-if args.dataset in ['cora','citeseer']:
-    alpha = 0.3    
-model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout,
-                                                args.dropout, args.subgraph_size,adj.shape[1],alpha=alpha)
-print('the running gama is %f, fpbal is %f' % (args.gama, args.beta))
-optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-if torch.cuda.is_available():
-    print('Using CUDA')
-    model.to(device)
-    features = features.to(device)
-    raw_feature = raw_feature.to(device)
-    adj = adj.to(device)
-    b_adj = b_adj.to(device)
+def gather_node_features(features: torch.Tensor, nodes: torch.Tensor) -> torch.Tensor:
+    batch_size, subgraph_size = nodes.shape
+    return features.index_select(0, nodes.reshape(-1)).reshape(batch_size, subgraph_size, -1)
+
+
+def pad_subgraph_adj(adj_batch: torch.Tensor) -> torch.Tensor:
+    batch_size, subgraph_size, _ = adj_batch.shape
+    padded = adj_batch.new_zeros((batch_size, subgraph_size + 1, subgraph_size + 1))
+    padded[:, :subgraph_size, :subgraph_size] = adj_batch
+    padded[:, -1, -1] = 1.0
+    return padded
+
+
+def insert_zero_before_target(feat_batch: torch.Tensor) -> torch.Tensor:
+    batch_size, subgraph_size, ft_size = feat_batch.shape
+    padded = feat_batch.new_zeros((batch_size, subgraph_size + 1, ft_size))
+    padded[:, :-2, :] = feat_batch[:, :-1, :]
+    padded[:, -1, :] = feat_batch[:, -1, :]
+    return padded
+
+
+def build_batch_inputs(idx, subgraphs, adj_base, diff_adj_base, modularity_base, features_base, raw_features_base, device):
+    idx = torch.as_tensor(idx, dtype=torch.long, device=device)
+    nodes = subgraphs.index_select(0, idx)
+
+    ba = pad_subgraph_adj(gather_square_matrix(adj_base, nodes))
+    br = pad_subgraph_adj(gather_square_matrix(diff_adj_base, nodes))
+    b_mod = pad_subgraph_adj(gather_square_matrix(modularity_base, nodes))
+    bf = insert_zero_before_target(gather_node_features(features_base, nodes))
+    raw = insert_zero_before_target(gather_node_features(raw_features_base, nodes))
+    return bf, ba, br, raw, b_mod
+
+
+def make_labels(batch_size: int, negsamp_ratio: int, device: torch.device) -> torch.Tensor:
+    pos = torch.ones(batch_size, device=device)
+    neg = torch.zeros(batch_size * negsamp_ratio, device=device)
+    return torch.cat((pos, neg)).unsqueeze(1)
+
+
+def pairwise_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.vector_norm(x - y, ord=2, dim=1)
+
+
+def _positive_minus_negative(logits: torch.Tensor, batch_size: int) -> torch.Tensor:
+    logits = logits.reshape(-1)
+    pos = logits[:batch_size]
+    neg = logits[batch_size:].reshape(-1, batch_size).mean(dim=0)
+    return pos - neg
+
+
+def get_contrastive_scores(logits1, logits2, batch_size: int) -> np.ndarray:
+    score1 = -_positive_minus_negative(logits1, batch_size)
+    score2 = -_positive_minus_negative(logits2, batch_size)
+    return ((score1 + score2) / 2.0).detach().cpu().numpy()
+
+
+def main():
+    args = parse_args()
+    if args.num_epoch is None:
+        args.num_epoch = 400 if args.dataset in {"ACM", "Flickr"} else 100
+    if args.dataset in {"ACM", "pubmed"}:
+        args.batch_size = 500
+
+    device = torch.device(args.device if args.device is not None else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    print(f"Dataset: {args.dataset}")
+    print(f"device: {device}")
+    print(f"gama={args.gama}, beta={args.beta}")
+
+    set_seed(args.seed)
+
+    print("checking edgelist and diff_A")
+    artifact_info = ensure_dataset_artifacts(
+        args.dataset,
+        data_root=args.data_root,
+        artifact_root=args.artifact_root,
+        alpha=args.gdc_alpha,
+        eps=args.gdc_eps,
+        force=args.force_preprocess,
+    )
+
+    normal_adj = load_edgelist_dense(artifact_info["edgelist_path"], num_nodes=artifact_info["num_nodes"])
+    num_edges = max(int(artifact_info["num_edges"]), 1)
+    degree = np.sum(normal_adj, axis=1)
+    expected_edges = np.outer(degree, degree) / (2 * num_edges)
+    modularity = normal_adj - expected_edges
+
+    adj, features, _, _, _, _, ano_label, _, _ = load_mat(args.dataset, data_root=args.data_root)
+    pyg_graph = adj_to_pyg_graph(None, adj)
+
+    diff_adj = load_diff_csr(artifact_info["diff_path"])
+    diff_adj = (diff_adj + sp.eye(diff_adj.shape[0])).todense()
+
+    raw_feature = features.todense()
+    features, _ = preprocess_features(features)
+    nb_nodes, ft_size = features.shape
+
+    c_features = torch.as_tensor(np.asarray(features), dtype=torch.float32)
+    c_adj = torch.as_tensor(adj.todense(), dtype=torch.float32, device=device)
+    c_features = rand_prop(features=c_features, dropnode_rate=0.5, A=c_adj, order=5, device=device).cpu()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    adj = normalize_adj(adj)
+    adj = (adj + sp.eye(adj.shape[0])).todense()
+
+    features = torch.as_tensor(np.asarray(features), dtype=torch.float32, device=device)
+    raw_feature = torch.as_tensor(np.asarray(raw_feature), dtype=torch.float32, device=device)
+    adj = torch.as_tensor(np.asarray(adj), dtype=torch.float32, device=device)
+    diff_adj = torch.as_tensor(np.asarray(diff_adj), dtype=torch.float32, device=device)
+    modularity = torch.as_tensor(np.asarray(modularity), dtype=torch.float32, device=device)
     c_features = c_features.to(device)
-    B = B.to(device)
-    if args.IsSwap:
-        c_features_pyg = c_features_pyg.to(device)
-    else:
-        c_features_pyg = c_features_pyg.to(device)
 
-if torch.cuda.is_available():
-    b_xent = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor([args.negsamp_ratio]).to(device))
-else:
-    b_xent = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor([args.negsamp_ratio]))
-xent = nn.CrossEntropyLoss()
-cnt_wait = 0
-best = 1e9
-best_t = 0
-best_auc = 0
-batch_num = nb_nodes // batch_size + 1
+    alpha = 0.3 if args.dataset in {"cora", "citeseer"} else 0.1
+    model = Model(
+        ft_size,
+        args.embedding_dim,
+        "prelu",
+        args.negsamp_ratio,
+        args.readout,
+        args.dropout,
+        args.subgraph_size,
+        adj.shape[0],
+        alpha=alpha,
+    ).to(device)
 
-added_adj_zero_row = torch.zeros((nb_nodes, 1, subgraph_size))
-added_adj_zero_col = torch.zeros((nb_nodes, subgraph_size + 1, 1))
-added_adj_zero_col[:, -1, :] = 1.
-added_feat_zero_row = torch.zeros((nb_nodes, 1, ft_size))
-if torch.cuda.is_available():
-    added_adj_zero_row = added_adj_zero_row.to(device)
-    added_adj_zero_col = added_adj_zero_col.to(device)
-    added_feat_zero_row = added_feat_zero_row.to(device)
-mse_loss = nn.MSELoss(reduction='mean')
-# Train model
-with tqdm(total=args.num_epoch) as pbar:
-    pbar.set_description('Training')
-    for epoch in range(args.num_epoch):
+    print("the running gama is %f, fpbal is %f" % (args.gama, args.beta))
+    optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    b_xent = nn.BCEWithLogitsLoss(
+        reduction="none",
+        pos_weight=torch.tensor([args.negsamp_ratio], dtype=torch.float32, device=device),
+    )
+    mse_loss = nn.MSELoss(reduction="mean")
 
-        loss_full_batch = torch.zeros((nb_nodes, 1))
-        if torch.cuda.is_available():
-            loss_full_batch = loss_full_batch.to(device)
+    cnt_wait = 0
+    best_loss = float("inf")
+    best_epoch = 0
+    best_auc = 0.0
+    checkpoint = Path(args.checkpoint)
 
-        model.train()
+    with tqdm(total=args.num_epoch, desc="Training") as pbar:
+        for epoch in range(args.num_epoch):
+            model.train()
+            total_loss = 0.0
+            num_batches = 0
+            subgraphs = torch.as_tensor(generate_rwr_subgraph(pyg_graph, args.subgraph_size), dtype=torch.long, device=device)
 
-        all_idx = list(range(nb_nodes))
+            for batch_no, idx in enumerate(iter_batches(nb_nodes, args.batch_size, shuffle=True)):
+                is_final_batch = batch_no == (nb_nodes - 1) // args.batch_size
+                cur_batch_size = len(idx)
+                lbl = make_labels(cur_batch_size, args.negsamp_ratio, device)
+                bf, ba, br, raw, b_mod = build_batch_inputs(
+                    idx, subgraphs, adj, diff_adj, modularity, features, raw_feature, device
+                )
 
-        random.shuffle(all_idx)
-        total_loss = 0.
-        subgraphs = generate_rwr_subgraph(pyg_graph, subgraph_size)
-        p = 0
-        i = 0
-        Flag = False
-        for batch_idx in range(batch_num):
+                optimiser.zero_grad(set_to_none=True)
+                now1, logits1, kl_1 = model(bf, ba, raw, b_mod)
+                now2, logits2, kl_2 = model(bf, br, raw, b_mod)
 
-            optimiser.zero_grad()
+                kl = 0.5 * (kl_2 + kl_1)
+                loss_re = 0.5 * (mse_loss(now1, raw[:, -1, :]) + mse_loss(now2, raw[:, -1, :]))
+                loss_bce = 0.5 * (b_xent(logits1, lbl) + b_xent(logits2, lbl))
 
-            is_final_batch = (batch_idx == (batch_num-1))
+                h_1 = F.normalize(logits1[:cur_batch_size, :], dim=1, p=2)
+                h_2 = F.normalize(logits2[:cur_batch_size, :], dim=1, p=2)
+                coloss = 2 - 2 * (h_1 * h_2).sum(dim=-1).mean()
 
-            if not is_final_batch:
-                idx = all_idx[batch_idx * batch_size: (batch_idx + 1) * batch_size]
-            else:
-                Flag = True
-                idx = all_idx[batch_idx * batch_size:]
-
-            cur_batch_size = len(idx)
-
-            # 拼成一个 cur_batch_size( 1 + negsamp_ratio) * 1 的tensor 对应1111100000
-            lbl = torch.unsqueeze(
-                torch.cat((torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio))), 1)
-
-            ba = []
-            bf = []
-            br = []
-            raw = []
-            BA = []
-            # cf = []
-
-            added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size))
-            added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1))
-            added_adj_zero_col[:, -1, :] = 1.
-            added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size))
-
-            if torch.cuda.is_available():
-                lbl = lbl.to(device)
-                added_adj_zero_row = added_adj_zero_row.to(device)
-                added_adj_zero_col = added_adj_zero_col.to(device)
-                added_feat_zero_row = added_feat_zero_row.to(device)
-
-            for i in idx:
-                cur_adj = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
-                cur_adj_r = b_adj[:, subgraphs[i], :][:, :, subgraphs[i]]
-                cur_adj_B = B[:, subgraphs[i], :][:, :, subgraphs[i]]
-                BA.append(cur_adj_B)
-                cur_feat = features[:, subgraphs[i], :]
-                raw_f = raw_feature[:, subgraphs[i], :]
-                ba.append(cur_adj)
-                bf.append(cur_feat)
-                raw.append(raw_f)
-                br.append(cur_adj_r)
-
-            ba = torch.cat(ba)
-            br = torch.cat(br)
-
-            BA = torch.cat(BA)
-            BA = torch.cat((BA, added_adj_zero_row), dim=1)
-            BA = torch.cat((BA, added_adj_zero_col), dim=2)
-
-            ba = torch.cat((ba, added_adj_zero_row), dim=1)
-            ba = torch.cat((ba, added_adj_zero_col), dim=2)
-
-            br = torch.cat((br, added_adj_zero_row), dim=1)
-            br = torch.cat((br, added_adj_zero_col), dim=2)
-
-
-            bf = torch.cat(bf)
-            bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]), dim=1)
-
-            raw = torch.cat(raw)
-            raw = torch.cat((raw[:, :-1, :], added_feat_zero_row, raw[:, -1:, :]), dim=1)
-
-            now1, logits,kl_1 = model(bf, ba, raw, BA)
-            if Flag == True:
-                now2, logits2, c_now, kl_2 = model(bf, br, raw, BA, c_features.unsqueeze(0), adj)
-            else:
-                now2, logits2, kl_2 = model(bf, br, raw, BA)
-
-
-            kl = 0.5 * (kl_2 + kl_1)
-            i = i + 1
-
-            # 重构误差
-            batch = now1.shape[0]
-            loss_re = 0.5 * (mse_loss(now1, raw[:, -1, :]) + mse_loss(now2, raw[:, -1, :]))
-            if Flag == True:
-                loss_global_re = torch.mean(
-                    torch.sqrt(torch.sum(torch.pow(c_now[:, :] - raw_feature[0, :, :], 2), 1))) * (
-                                            args.batch_size / adj.shape[1])
-
-            loss_all2 = b_xent(logits2, lbl)
-            loss_all1 = b_xent(logits, lbl)
-            loss_bce = (loss_all1 + loss_all2) / 2
-
-            h_1 = F.normalize(logits[:batch, :], dim=1, p=2)
-            h_2 = F.normalize(logits2[:batch, :], dim=1, p=2)
-            coloss2 = 2 - 2 * (h_1 * h_2).sum(dim=-1).mean()
-            if Flag == True:
-                loss = (1 - args.beta) * (torch.mean(loss_bce) + coloss2 + args.gama * loss_re) \
-                    + args.beta * loss_global_re + 0.5 * kl
-                tmp_loss = torch.mean(loss_bce) + coloss2 + args.gama * loss_re
-            else:
-                loss = (1 - args.beta) * (torch.mean(loss_bce) + coloss2 + args.gama * loss_re) + 0.5 *  kl
-            loss.backward()
-            optimiser.step()
-
-            loss = loss.detach().cpu().numpy()
-
-            total_loss += loss
-            p = p + 1
-        if args.earlystop:
-                with torch.no_grad():
-                    now1, logits,_ = model(bf, ba, raw, BA)
-                    now2, logits2, c_now,_ = model(bf, br, raw, BA, c_features.unsqueeze(0), adj)
-                    # c_now = c_now.to(device)
-                    # now2, logits2 = model(bf, br, raw)
-                    logits = torch.squeeze(logits)
-                    logits = torch.sigmoid(logits)
-
-                    logits2 = torch.squeeze(logits2)
-                    logits2 = torch.sigmoid(logits2)
-                scaler1 = MinMaxScaler()
-                scaler2 = MinMaxScaler()
-                scaler3 = MinMaxScaler()
-                    # 相当于就是说，前半部分是一个negative，后边部分是positive
-                ano_score1 = - (logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
-                ano_score2 = - (logits2[:cur_batch_size] - logits2[cur_batch_size:]).cpu().numpy()
-                    # ano_score3 = - (logits3[:cur_batch_size] - logits3[cur_batch_size:]).cpu().numpy()
-                    # 属性的重构误差
-                pdist = nn.PairwiseDistance(p=2)
-                score1 = (pdist(now1, raw[:, -1, :]) + pdist(now2, raw[:, -1, :])) / 2
-                score_global_re = pdist(c_now.to(device), raw_feature[0, :, :])
-                score_global_re = score_global_re.cpu().numpy()
-                score_global_re = scaler3.fit_transform(score_global_re.reshape(-1, 1)).reshape(-1)
-                score2 = (ano_score1 + ano_score2) / 2
-                score1 = score1.cpu().numpy()
-                ano_score_co = scaler1.fit_transform(score2.reshape(-1, 1)).reshape(-1)
-                score_re = scaler2.fit_transform(score1.reshape(-1, 1)).reshape(-1)
-                ano_scores = ano_score_co + args.gama * score_re
-                final_test_score = score_global_re
-                test_auc = roc_auc_score(ano_label, final_test_score)
-                if test_auc > best_auc:
-                    best_auc = test_auc
+                local_loss = torch.mean(loss_bce) + coloss + args.gama * loss_re
+                if is_final_batch:
+                    c_now = model.global_reconstruct(c_features.unsqueeze(0), adj.unsqueeze(0))
+                    loss_global_re = pairwise_l2(c_now[0], raw_feature).mean() * (args.batch_size / adj.shape[0])
+                    loss = (1 - args.beta) * local_loss + args.beta * loss_global_re + 0.5 * kl
                 else:
-                    pbar.update(1)
+                    loss = (1 - args.beta) * local_loss + 0.5 * kl
+
+                loss.backward()
+                optimiser.step()
+
+                total_loss += float(loss.detach().cpu())
+                num_batches += 1
+
+            mean_loss = total_loss / max(num_batches, 1)
+
+            if args.earlystop:
+                model.eval()
+                with torch.no_grad():
+                    c_now = model.global_reconstruct(c_features.unsqueeze(0), adj.unsqueeze(0))
+                    global_score = minmax_scale_np(pairwise_l2(c_now[0], raw_feature).cpu().numpy())
+                    val_auc, _ = compute_metrics(ano_label, global_score)
+                if val_auc > best_auc:
+                    best_auc = val_auc
+                else:
                     cnt_wait += 1
                     if cnt_wait > 200:
+                        pbar.update(1)
                         break
-                    else:
-                        continue
-            
-        mean_loss = total_loss
 
-        if mean_loss < best:
-            best = mean_loss
-            best_t = epoch
-            cnt_wait = 0
-            torch.save(model.state_dict(), 'best.pkl')  # multi_round_ano_score_p[round, idx] = ano_score_p
-
-        else:
-            cnt_wait += 1
-
-        pbar.update(1)
-
-# # # # # Test model
-
-print('testing_' + args.dataset)
-print('Loading {}th epoch from the training'.format(best_t))
-
-model.load_state_dict(torch.load('best.pkl'))
-
-multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes))
-multi_round_ano_score_p = np.zeros((args.auc_test_rounds, nb_nodes))
-multi_round_ano_score_n = np.zeros((args.auc_test_rounds, nb_nodes))
-multi_round_ano_score_global = np.zeros((args.auc_test_rounds, nb_nodes))
-kk = 0
-
-with tqdm(total=args.auc_test_rounds) as pbar_test:
-    pbar_test.set_description('EVALUTION CARD')
-    for round in range(args.auc_test_rounds):
-
-        all_idx = list(range(nb_nodes))
-        random.shuffle(all_idx)
-
-        subgraphs = generate_rwr_subgraph(pyg_graph, subgraph_size)
-        for batch_idx in range(batch_num):
-
-            optimiser.zero_grad()
-
-            is_final_batch = (batch_idx == (batch_num - 1))
-
-            if not is_final_batch:
-                idx = all_idx[batch_idx * batch_size: (batch_idx + 1) * batch_size]
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                best_epoch = epoch
+                cnt_wait = 0
+                torch.save(model.state_dict(), checkpoint)
             else:
-                idx = all_idx[batch_idx * batch_size:]
+                cnt_wait += 1
 
-            cur_batch_size = len(idx)
+            pbar.set_postfix(loss=f"{mean_loss:.4f}", best_epoch=best_epoch)
+            pbar.update(1)
 
-            ba = []
-            bf = []
-            br = []
-            raw = []
-            BA = []
-            #  cf = []
-            added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size))
-            added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1))
-            added_adj_zero_col[:, -1, :] = 1.
-            added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size))
+    print("testing_" + args.dataset)
+    print("Loading {}th epoch from the training".format(best_epoch))
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.eval()
 
-            if torch.cuda.is_available():
-                added_adj_zero_row = added_adj_zero_row.to(device)
-                added_adj_zero_col = added_adj_zero_col.to(device)
-                added_feat_zero_row = added_feat_zero_row.to(device)
+    multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float32)
+    multi_round_ano_score_global = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float32)
 
-            for i in idx:
-                cur_adj = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
-                cur_adj2 = b_adj[:, subgraphs[i], :][:, :, subgraphs[i]]
-                cur_feat = features[:, subgraphs[i], :]
-                raw_f = raw_feature[:, subgraphs[i], :]
-                # cur_c_feat = c_features[:, subgraphs[i], :]
-                # cf.append(cur_c_feat)
+    with torch.no_grad(), tqdm(total=args.auc_test_rounds, desc="EVALUATION CARD") as pbar_test:
+        for round_idx in range(args.auc_test_rounds):
+            subgraphs = torch.as_tensor(generate_rwr_subgraph(pyg_graph, args.subgraph_size), dtype=torch.long, device=device)
 
-                cur_adj_B = B[:, subgraphs[i], :][:, :, subgraphs[i]]
-                BA.append(cur_adj_B)
+            c_now = model.global_reconstruct(c_features.unsqueeze(0), adj.unsqueeze(0))
+            global_score = pairwise_l2(c_now[0], raw_feature).cpu().numpy()
+            multi_round_ano_score_global[round_idx, :] = minmax_scale_np(global_score)
 
-                ba.append(cur_adj)
-                br.append(cur_adj2)
-                bf.append(cur_feat)
-                raw.append(raw_f)
+            for idx in iter_batches(nb_nodes, args.batch_size, shuffle=True):
+                cur_batch_size = len(idx)
+                bf, ba, br, raw, b_mod = build_batch_inputs(
+                    idx, subgraphs, adj, diff_adj, modularity, features, raw_feature, device
+                )
 
-            ba = torch.cat(ba)
-            ba = torch.cat((ba, added_adj_zero_row), dim=1)
-            ba = torch.cat((ba, added_adj_zero_col), dim=2)
-            br = torch.cat(br)
-            br = torch.cat((br, added_adj_zero_row), dim=1)
-            br = torch.cat((br, added_adj_zero_col), dim=2)
+                now1, logits1, _ = model(bf, ba, raw, b_mod)
+                now2, logits2, _ = model(bf, br, raw, b_mod)
+                logits1 = torch.sigmoid(torch.squeeze(logits1))
+                logits2 = torch.sigmoid(torch.squeeze(logits2))
 
-            bf = torch.cat(bf)
-            bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]), dim=1)
+                score_co = minmax_scale_np(get_contrastive_scores(logits1, logits2, cur_batch_size))
+                score_re = 0.5 * (pairwise_l2(now1, raw[:, -1, :]) + pairwise_l2(now2, raw[:, -1, :]))
+                score_re = minmax_scale_np(score_re.cpu().numpy())
+                multi_round_ano_score[round_idx, idx] = score_co + args.gama * score_re
 
-            BA = torch.cat(BA)
-            BA = torch.cat((BA, added_adj_zero_row), dim=1)
-            BA = torch.cat((BA, added_adj_zero_col), dim=2)
+            pbar_test.update(1)
+
+    ano_score_final = (
+        (1 - args.beta) * np.mean(multi_round_ano_score, axis=0)
+        + args.beta * np.mean(multi_round_ano_score_global, axis=0)
+    )
+    roc_auc, auprc = compute_metrics(ano_label, ano_score_final)
+    print("the auc is ", roc_auc)
+    print("the auprc is ", auprc)
 
 
-            raw = torch.cat(raw)
-            raw = torch.cat((raw[:, :-1, :], added_feat_zero_row, raw[:, -1:, :]), dim=1)
-
-            with torch.no_grad():
-                now1, logits,_ = model(bf, ba, raw, BA)
-                now2, logits2, c_now,_ = model(bf, br, raw, BA, c_features.unsqueeze(0), adj)
-                # c_now = c_now.to(device)
-                # now2, logits2 = model(bf, br, raw)
-                logits = torch.squeeze(logits)
-                logits = torch.sigmoid(logits)
-
-                logits2 = torch.squeeze(logits2)
-                logits2 = torch.sigmoid(logits2)
-
-
-
-            scaler1 = MinMaxScaler()
-            scaler2 = MinMaxScaler()
-            scaler3 = MinMaxScaler()
-            ano_score1 = - (logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
-            ano_score2 = - (logits2[:cur_batch_size] - logits2[cur_batch_size:]).cpu().numpy()
-            pdist = nn.PairwiseDistance(p=2)
-            score1 = (pdist(now1, raw[:, -1, :]) + pdist(now2, raw[:, -1, :])) / 2
-            score_global_re = pdist(c_now.to(device), raw_feature[0, :, :])
-            score_global_re = score_global_re.cpu().numpy()
-            score_global_re = scaler3.fit_transform(score_global_re.reshape(-1, 1)).reshape(-1)
-            multi_round_ano_score_global[round, :] = score_global_re
-            score2 = (ano_score1 + ano_score2) / 2
-            score1 = score1.cpu().numpy()
-
-            ano_score_co = scaler1.fit_transform(score2.reshape(-1, 1)).reshape(-1)
-            score_re = scaler2.fit_transform(score1.reshape(-1, 1)).reshape(-1)
-
-            ano_scores = ano_score_co + args.gama * score_re
-            multi_round_ano_score[round, idx] = ano_scores
-
-        pbar_test.update(1)
-
-scaler1 = MinMaxScaler()
-resultList  = []
-ano_score_final = (1 - args.beta) * np.mean(multi_round_ano_score, axis=0) + args.beta * np.mean(multi_round_ano_score_global, axis=0)
-auc = roc_auc_score(ano_label, ano_score_final)
-print('the auc is ', auc)
+if __name__ == "__main__":
+    main()

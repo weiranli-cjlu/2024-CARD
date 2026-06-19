@@ -1,5 +1,4 @@
 import numpy as np
-import scipy.io as sio
 import scipy.sparse as sp
 import torch
 

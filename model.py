@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn.conv import ChebConv
 
 
 class GCN(nn.Module):
@@ -25,7 +24,7 @@ class GCN(nn.Module):
             if m.bias is not None:
                 m.bias.data.fill_(0.0)
 
-    def forward(self, seq, adj, du, sparse=False):
+    def forward(self, seq, adj, sparse=False):
         seq_fts = self.fc(seq)
         if sparse:
             out = torch.unsqueeze(torch.spmm(adj, torch.squeeze(seq_fts, 0)), 0)
@@ -122,9 +121,6 @@ class Model(nn.Module):
         self.GlobalfeatEnc = GCN(n_in, n_h, activation, dropout)
         self.GlobalfeatDec = GCN(n_h, n_in, activation, dropout)
         self.alpha = alpha
-        self.hidden_size = 128
-        # ————————————————————————————————————————————
-
         # 这里的B是一个矩阵，谨慎输入。
         self.B_network = nn.Sequential(
             nn.Linear(subgraph_size + 1, int(n_h / 2)),
@@ -139,8 +135,6 @@ class Model(nn.Module):
         self.hidden_size = 128
         self.act = nn.PReLU()
         # decode
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        # self.device = torch.device('cpu')
         self.network = nn.Sequential(
             nn.Linear(n_h, self.hidden_size),
             nn.PReLU(),
@@ -184,7 +178,6 @@ class Model(nn.Module):
         kl_loss = 0.5 * (kl_loss_2 + kl_loss_1)
 
         sub_size = h_row.shape[1]
-        batch = h_row.shape[0]
         aa = h_row[:, :sub_size - 2, :]   # 直接readout。
 
         input_nei = self.subgraphRead(aa[:]) # 这里可以改成更好的readout方法
@@ -199,10 +192,11 @@ class Model(nn.Module):
             c = self.read(h_1[:, : -1, :], h_1[:, -2: -1, :])
 
         ret = self.disc(c, h_mv)  # 最后的logit 这里是discriminator
-
-        if globalGraph != None:
-            glob_h = self.GlobalfeatEnc(globalGraph, c_adj, False)
-            glob_h = self.act(glob_h)
-            glob_re = self.GlobalfeatDec(glob_h, c_adj, False)
-            return now, ret, glob_re, kl_loss
+        if globalGraph is not None:
+            return now, ret, self.global_reconstruct(globalGraph, c_adj), kl_loss
         return now, ret, kl_loss
+
+    def global_reconstruct(self, globalGraph, c_adj):
+        glob_h = self.GlobalfeatEnc(globalGraph, c_adj, False)
+        glob_h = self.act(glob_h)
+        return self.GlobalfeatDec(glob_h, c_adj, False)
