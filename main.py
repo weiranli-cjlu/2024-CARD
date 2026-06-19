@@ -1,6 +1,10 @@
 import argparse
+import copy
+import csv
+import gc
 import os
 import random
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +34,9 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="cora")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=2, help="Base seed. Trial i uses seed + i * seed_step.")
+    parser.add_argument("--seed_step", type=int, default=1, help="Seed increment between trials.")
+    parser.add_argument("--trials", type=int, default=1, help="Number of repeated training/evaluation trials.")
     parser.add_argument("--embedding_dim", type=int, default=64)
     parser.add_argument("--num_epoch", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=300)
@@ -48,7 +54,9 @@ def parse_args():
     parser.add_argument("--gdc_alpha", type=float, default=0.01, help="GDC alpha for diff_A generation")
     parser.add_argument("--gdc_eps", type=float, default=0.0001, help="GDC epsilon threshold for diff_A generation")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda:0, cuda:1 or cpu")
-    parser.add_argument("--checkpoint", type=str, default="best.pkl")
+    parser.add_argument("--checkpoint", type=str, default="best.pkl", help="Checkpoint path. Multi-trial will append dataset/seed to avoid overwrite.")
+    parser.add_argument("--result_csv", type=str, default="results/card_multitrial.csv", help="CSV file used to append multi-trial summary.")
+    parser.add_argument("--no_save_csv", action="store_true", help="Do not append summary to CSV.")
     return parser.parse_args()
 
 
@@ -76,6 +84,7 @@ def minmax_scale_np(values: np.ndarray) -> np.ndarray:
 
 
 def compute_metrics(labels: np.ndarray, scores: np.ndarray):
+    """Return AUROC and AUPRC as decimals in [0, 1]."""
     labels = np.asarray(labels).reshape(-1).astype(np.int64)
     scores = np.asarray(scores).reshape(-1)
     roc_auc = roc_auc_score(labels, scores)
@@ -83,6 +92,26 @@ def compute_metrics(labels: np.ndarray, scores: np.ndarray):
     auprc = sklearn_auc(recall, precision)
     return roc_auc, auprc
 
+
+def format_metric(values) -> str:
+    """Format decimal metric values as percentage mean±std(max), e.g. 90.21±2.33(91.00)."""
+    arr = np.asarray(values, dtype=np.float64) * 100.0
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=0)) if arr.size > 1 else 0.0
+    best = float(np.max(arr))
+    return f"{mean:.2f}±{std:.2f}({best:.2f})"
+
+
+def append_result_csv(path: str, row: dict) -> None:
+    csv_path = Path(path).expanduser()
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["datetime", "trial", "dataset", "auc", "auprc"]
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 def iter_batches(num_nodes: int, batch_size: int, shuffle: bool = True):
     indices = np.arange(num_nodes)
@@ -123,7 +152,6 @@ def insert_zero_before_target(feat_batch: torch.Tensor) -> torch.Tensor:
 def build_batch_inputs(idx, subgraphs, adj_base, diff_adj_base, modularity_base, features_base, raw_features_base, device):
     idx = torch.as_tensor(idx, dtype=torch.long, device=device)
     nodes = subgraphs.index_select(0, idx)
-
     ba = pad_subgraph_adj(gather_square_matrix(adj_base, nodes))
     br = pad_subgraph_adj(gather_square_matrix(diff_adj_base, nodes))
     b_mod = pad_subgraph_adj(gather_square_matrix(modularity_base, nodes))
@@ -155,17 +183,20 @@ def get_contrastive_scores(logits1, logits2, batch_size: int) -> np.ndarray:
     return ((score1 + score2) / 2.0).detach().cpu().numpy()
 
 
-def main():
-    args = parse_args()
+def apply_dataset_defaults(args) -> None:
     if args.num_epoch is None:
         args.num_epoch = 400 if args.dataset in {"ACM", "Flickr"} else 100
     if args.dataset in {"ACM", "pubmed"}:
         args.batch_size = 500
 
+
+def run_single_trial(args):
+    apply_dataset_defaults(args)
+
     device = torch.device(args.device if args.device is not None else ("cuda:0" if torch.cuda.is_available() else "cpu"))
     print(f"Dataset: {args.dataset}")
     print(f"device: {device}")
-    print(f"gama={args.gama}, beta={args.beta}")
+    print(f"seed={args.seed}, gama={args.gama}, beta={args.beta}")
 
     set_seed(args.seed)
 
@@ -236,7 +267,7 @@ def main():
     best_loss = float("inf")
     best_epoch = 0
     best_auc = 0.0
-    checkpoint = Path(args.checkpoint)
+    checkpoint = Path(args.checkpoint).expanduser()
 
     with tqdm(total=args.num_epoch, desc="Training") as pbar:
         for epoch in range(args.num_epoch):
@@ -256,16 +287,15 @@ def main():
                 optimiser.zero_grad(set_to_none=True)
                 now1, logits1, kl_1 = model(bf, ba, raw, b_mod)
                 now2, logits2, kl_2 = model(bf, br, raw, b_mod)
-
                 kl = 0.5 * (kl_2 + kl_1)
+
                 loss_re = 0.5 * (mse_loss(now1, raw[:, -1, :]) + mse_loss(now2, raw[:, -1, :]))
                 loss_bce = 0.5 * (b_xent(logits1, lbl) + b_xent(logits2, lbl))
-
                 h_1 = F.normalize(logits1[:cur_batch_size, :], dim=1, p=2)
                 h_2 = F.normalize(logits2[:cur_batch_size, :], dim=1, p=2)
                 coloss = 2 - 2 * (h_1 * h_2).sum(dim=-1).mean()
-
                 local_loss = torch.mean(loss_bce) + coloss + args.gama * loss_re
+
                 if is_final_batch:
                     c_now = model.global_reconstruct(c_features.unsqueeze(0), adj.unsqueeze(0))
                     loss_global_re = pairwise_l2(c_now[0], raw_feature).mean() * (args.batch_size / adj.shape[0])
@@ -317,7 +347,6 @@ def main():
     with torch.no_grad(), tqdm(total=args.auc_test_rounds, desc="EVALUATION CARD") as pbar_test:
         for round_idx in range(args.auc_test_rounds):
             subgraphs = torch.as_tensor(generate_rwr_subgraph(pyg_graph, args.subgraph_size), dtype=torch.long, device=device)
-
             c_now = model.global_reconstruct(c_features.unsqueeze(0), adj.unsqueeze(0))
             global_score = pairwise_l2(c_now[0], raw_feature).cpu().numpy()
             multi_round_ano_score_global[round_idx, :] = minmax_scale_np(global_score)
@@ -327,7 +356,6 @@ def main():
                 bf, ba, br, raw, b_mod = build_batch_inputs(
                     idx, subgraphs, adj, diff_adj, modularity, features, raw_feature, device
                 )
-
                 now1, logits1, _ = model(bf, ba, raw, b_mod)
                 now2, logits2, _ = model(bf, br, raw, b_mod)
                 logits1 = torch.sigmoid(torch.squeeze(logits1))
@@ -337,7 +365,6 @@ def main():
                 score_re = 0.5 * (pairwise_l2(now1, raw[:, -1, :]) + pairwise_l2(now2, raw[:, -1, :]))
                 score_re = minmax_scale_np(score_re.cpu().numpy())
                 multi_round_ano_score[round_idx, idx] = score_co + args.gama * score_re
-
             pbar_test.update(1)
 
     ano_score_final = (
@@ -347,6 +374,47 @@ def main():
     roc_auc, auprc = compute_metrics(ano_label, ano_score_final)
     print("the auc is ", roc_auc)
     print("the auprc is ", auprc)
+    return roc_auc, auprc
+
+
+def main():
+    args = parse_args()
+    if args.trials <= 0:
+        raise ValueError("--trials must be positive.")
+
+    auc_values = []
+    auprc_values = []
+
+    for trial_idx in range(args.trials):
+        trial_seed = args.seed + trial_idx * args.seed_step
+        trial_args = copy.copy(args)
+        trial_args.seed = trial_seed
+        trial_args.checkpoint = str(Path(args.checkpoint).expanduser())
+
+        print(f"\n========== CARD trial {trial_idx + 1}/{args.trials}, seed={trial_seed} ==========")
+        auc_value, auprc_value = run_single_trial(trial_args)
+        auc_values.append(auc_value)
+        auprc_values.append(auprc_value)
+        print(f"[trial {trial_idx + 1}/{args.trials}] auc={auc_value:.6f}, auprc={auprc_value:.6f}")
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    summary = {
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "trial": args.trials,
+        "dataset": args.dataset,
+        "auc": format_metric(auc_values),
+        "auprc": format_metric(auprc_values),
+    }
+
+    print("\n========== Multi-trial summary ==========")
+    print(summary)
+
+    if not args.no_save_csv:
+        append_result_csv(args.result_csv, summary)
+        print(f"Saved CSV to: {Path(args.result_csv).expanduser()}")
 
 
 if __name__ == "__main__":
