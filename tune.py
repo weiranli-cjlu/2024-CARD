@@ -1,16 +1,12 @@
-"""Optuna hyper-parameter tuning script for CARD.
+"""Optuna tuning for CARD on one dataset at a time.
 
-This script keeps the original training entry (`main.py`) unchanged.  Each
-Optuna trial launches `main.py` as a subprocess, parses the final printed
-ROC-AUC/AUPRC, and records per-run results to CSV.
+The tuner launches ``main.py`` as a subprocess.  It does not save model
+checkpoints; it records trial metrics/parameters to CSV and writes a small
+best-parameter summary for convenience.
 
 Typical usage:
     pip install optuna
-    python optuna_tune.py --datasets cora --n_trials 50 --device cuda:0
-
-For faster search, the script defaults to fewer evaluation rounds than the
-paper-style final evaluation.  After finding the best parameters, rerun
-`main.py` with `--auc_test_rounds 150` for the final reported result.
+    python tune.py --dataset cora --n_trials 50 --device cuda:0
 """
 
 from __future__ import annotations
@@ -28,7 +24,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import optuna
 
@@ -48,90 +44,44 @@ class RunResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Tune CARD hyper-parameters with Optuna by calling main.py."
-    )
-    parser.add_argument(
-        "--datasets",
-        nargs="+",
-        default=["cora"],
-        help="One or more datasets to optimize on, e.g. cora citeseer pubmed.",
-    )
+    parser = argparse.ArgumentParser(description="Tune CARD hyper-parameters on one dataset.")
+    parser.add_argument("--dataset", type=str, default="cora", help="Single dataset name, e.g. cora.")
     parser.add_argument("--n_trials", type=int, default=50)
     parser.add_argument("--study_name", type=str, default=None)
     parser.add_argument(
         "--storage",
         type=str,
         default=None,
-        help=(
-            "Optuna storage URI. Example: sqlite:///optuna_results/card.db. "
-            "If omitted, an in-memory study is used."
-        ),
+        help="Optuna storage URI, e.g. sqlite:///optuna_results/card.db. Omit for in-memory study.",
     )
     parser.add_argument("--sampler_seed", type=int, default=42)
     parser.add_argument(
         "--objective",
         choices=["auc", "auprc", "mean", "harmonic"],
         default="auc",
-        help="Metric used as the Optuna objective."
+        help="Metric optimized by Optuna.",
     )
-    parser.add_argument(
-        "--main",
-        type=str,
-        default="main.py",
-        help="Path to CARD main.py. Default assumes running in the repo root.",
-    )
-    parser.add_argument(
-        "--python",
-        type=str,
-        default=sys.executable,
-        help="Python executable used to launch main.py.",
-    )
-    parser.add_argument("--device", type=str, default=None, help="cuda:0, cuda:1, or cpu")
+    parser.add_argument("--main", type=str, default="main.py", help="Path to CARD main.py.")
+    parser.add_argument("--python", type=str, default=sys.executable, help="Python executable used to launch main.py.")
+    parser.add_argument("--device", type=str, default=None, help="cuda:0, cuda:1, or cpu.")
     parser.add_argument("--data_root", type=str, default="~/datasets/GAD/mat")
     parser.add_argument("--artifact_root", type=str, default=".")
-    parser.add_argument(
-        "--num_epoch",
-        type=int,
-        default=None,
-        help="Override main.py --num_epoch. Omit to use main.py defaults.",
-    )
+    parser.add_argument("--num_epoch", type=int, default=None, help="Override main.py --num_epoch.")
     parser.add_argument(
         "--auc_test_rounds",
         type=int,
         default=20,
-        help=(
-            "Evaluation rounds during tuning. Use a smaller value for speed; "
-            "rerun final experiments with 150 if needed."
-        ),
+        help="Evaluation rounds during tuning. Use a smaller value for speed.",
     )
+    parser.add_argument("--seeds", type=str, default="2", help="Comma-separated seeds, e.g. 2,3,4.")
+    parser.add_argument("--timeout", type=int, default=None, help="Subprocess timeout in seconds for each seed.")
+    parser.add_argument("--output_dir", type=str, default="optuna_results", help="Directory for tuning CSV and summaries.")
+    parser.add_argument("--force_preprocess", action="store_true", help="Forward --force_preprocess to main.py.")
+    parser.add_argument("--no_earlystop", action="store_true", help="Forward --no-earlystop to main.py.")
     parser.add_argument(
-        "--seeds",
-        type=str,
-        default="2",
-        help="Comma-separated seeds evaluated for each trial, e.g. 2,3,4.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=None,
-        help="Subprocess timeout in seconds for each dataset/seed run.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="optuna_results",
-        help="Directory for CSV, and best parameter JSON.",
-    )
-    parser.add_argument(
-        "--force_preprocess",
+        "--save_main_csv",
         action="store_true",
-        help="Forward --force_preprocess to main.py. Usually keep this disabled.",
-    )
-    parser.add_argument(
-        "--no_earlystop",
-        action="store_true",
-        help="Forward --no-earlystop to main.py."
+        help="Let each launched main.py append to its own result CSV. Disabled by default to avoid duplicate logs.",
     )
     parser.add_argument(
         "--extra_args",
@@ -139,32 +89,29 @@ def parse_args() -> argparse.Namespace:
         default="",
         help='Extra arguments passed verbatim to main.py, e.g. "--gdc_alpha 0.01".',
     )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Print one sampled command without running Optuna optimization.",
-    )
+    parser.add_argument("--dry_run", action="store_true", help="Print one sampled command without running Optuna.")
     return parser.parse_args()
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if args.n_trials <= 0:
+        raise ValueError("--n_trials must be positive.")
+    if any(sep in args.dataset for sep in [",", " ", "\t"]):
+        raise ValueError("--dataset only accepts one dataset name. Run tune.py again for another dataset.")
+
+
 def parse_seed_list(seed_text: str) -> List[int]:
-    seeds = []
-    for item in seed_text.split(","):
-        item = item.strip()
-        if item:
-            seeds.append(int(item))
+    seeds = [int(item.strip()) for item in seed_text.split(",") if item.strip()]
     if not seeds:
-        raise ValueError("--seeds cannot be empty")
+        raise ValueError("--seeds cannot be empty.")
     return seeds
 
 
 def sample_params(trial: optuna.Trial) -> Dict[str, object]:
-    """Search space matched to the current CARD `main.py` CLI."""
-    params: Dict[str, object] = {
+    """Search space matched to the current CARD ``main.py`` CLI."""
+    return {
         "lr": trial.suggest_float("lr", 1e-5, 5e-3, log=True),
-        "weight_decay": trial.suggest_float(
-            "weight_decay", 1e-5, 1e-3, log=True
-        ),
+        "weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
         "embedding_dim": trial.suggest_categorical("embedding_dim", [32, 64, 128]),
         "batch_size": trial.suggest_categorical("batch_size", [128, 256, 300]),
         "subgraph_size": trial.suggest_categorical("subgraph_size", [3, 4, 5, 6, 8]),
@@ -174,7 +121,6 @@ def sample_params(trial: optuna.Trial) -> Dict[str, object]:
         "gama": trial.suggest_float("gama", 0.0, 1.0),
         "beta": trial.suggest_float("beta", 0.0, 1.0),
     }
-    return params
 
 
 def params_to_cli(params: Dict[str, object]) -> List[str]:
@@ -184,16 +130,11 @@ def params_to_cli(params: Dict[str, object]) -> List[str]:
     return args
 
 
-def build_command(
-    base_args: argparse.Namespace,
-    params: Dict[str, object],
-    dataset: str,
-    seed: int,
-) -> List[str]:
+def build_command(base_args: argparse.Namespace, params: Dict[str, object], seed: int) -> List[str]:
     command = [
         base_args.python,
         base_args.main,
-        "--dataset", dataset,
+        "--dataset", base_args.dataset,
         "--seed", str(seed),
         "--data_root", base_args.data_root,
         "--artifact_root", base_args.artifact_root,
@@ -207,6 +148,8 @@ def build_command(
         command.append("--force_preprocess")
     if base_args.no_earlystop:
         command.append("--no-earlystop")
+    if not base_args.save_main_csv:
+        command.append("--no_save_csv")
     command.extend(params_to_cli(params))
     if base_args.extra_args.strip():
         command.extend(shlex.split(base_args.extra_args))
@@ -229,15 +172,8 @@ def parse_metrics(output: str) -> Tuple[float, float]:
     return auc, auprc
 
 
-def run_one(
-    base_args: argparse.Namespace,
-    params: Dict[str, object],
-    dataset: str,
-    seed: int,
-    trial_number: int,
-    output_dir: Path,
-) -> RunResult:
-    command = build_command(base_args, params, dataset, seed)
+def run_one(base_args: argparse.Namespace, params: Dict[str, object], seed: int) -> RunResult:
+    command = build_command(base_args, params, seed)
     command_text = " ".join(shlex.quote(x) for x in command)
 
     start = time.perf_counter()
@@ -262,7 +198,7 @@ def run_one(
 
     auc, auprc = parse_metrics(completed.stdout)
     return RunResult(
-        dataset=dataset,
+        dataset=base_args.dataset,
         seed=seed,
         auc=auc,
         auprc=auprc,
@@ -292,36 +228,27 @@ def append_rows(csv_path: Path, rows: Iterable[Dict[str, object]]) -> None:
         return
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0].keys())
-    file_exists = csv_path.exists()
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
+        if write_header:
             writer.writeheader()
         writer.writerows(rows)
 
 
 def make_objective(base_args: argparse.Namespace, output_dir: Path):
-    datasets = list(base_args.datasets)
     seeds = parse_seed_list(base_args.seeds)
-    trial_csv = output_dir / (base_args.study_name + ".csv")
+    trial_csv = output_dir / f"{base_args.study_name}.csv"
 
     def objective(trial: optuna.Trial) -> float:
         params = sample_params(trial)
         started_at = datetime.now().isoformat(timespec="seconds")
         results: List[RunResult] = []
+
         try:
-            for dataset in datasets:
-                for seed in seeds:
-                    result = run_one(
-                        base_args=base_args,
-                        params=params,
-                        dataset=dataset,
-                        seed=seed,
-                        trial_number=trial.number,
-                        output_dir=output_dir,
-                    )
-                    results.append(result)
-        except Exception as exc:  # noqa: BLE001 - store useful failure info for Optuna.
+            for seed in seeds:
+                results.append(run_one(base_args, params, seed))
+        except Exception as exc:  # Store useful failure info for Optuna.
             trial.set_user_attr("failed_params", params)
             trial.set_user_attr("error", repr(exc))
             append_rows(
@@ -332,7 +259,7 @@ def make_objective(base_args: argparse.Namespace, output_dir: Path):
                         "trial": trial.number,
                         "state": "failed_or_pruned",
                         "objective": "",
-                        "dataset": "",
+                        "dataset": base_args.dataset,
                         "seed": "",
                         "auc": "",
                         "auprc": "",
@@ -352,9 +279,9 @@ def make_objective(base_args: argparse.Namespace, output_dir: Path):
         trial.set_user_attr("mean_auprc", mean_auprc)
         trial.set_user_attr("params", params)
 
-        rows = []
-        for result in results:
-            rows.append(
+        append_rows(
+            trial_csv,
+            [
                 {
                     "datetime": started_at,
                     "trial": trial.number,
@@ -369,8 +296,9 @@ def make_objective(base_args: argparse.Namespace, output_dir: Path):
                     "command": result.command,
                     "error": "",
                 }
-            )
-        append_rows(trial_csv, rows)
+                for result in results
+            ],
+        )
         print(
             f"[trial {trial.number}] objective={score:.6f}, "
             f"mean_auc={mean_auc:.6f}, mean_auprc={mean_auprc:.6f}, params={params}"
@@ -380,26 +308,30 @@ def make_objective(base_args: argparse.Namespace, output_dir: Path):
     return objective
 
 
-def save_best(study: optuna.Study, output_dir: Path, args) -> None:
-    best = {
+def save_best_params(study: optuna.Study, output_dir: Path, args: argparse.Namespace) -> None:
+    summary = {
         "study_name": study.study_name,
+        "dataset": args.dataset,
+        "objective": args.objective,
         "best_trial": study.best_trial.number,
         "best_value": study.best_value,
         "best_params": study.best_params,
     }
-    (output_dir / (args.study_name+".json")).write_text(
-        json.dumps(best, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
-    )
-    
-        
-    best_cmd = f"python main.py --dataset {args.datasets[0]}  --trials 10 " + "".join([f" --{k} {v}" for k, v in study.best_params.items()])
-    with open(output_dir / (args.study_name+".sh"), "w") as f:
-        f.write(best_cmd)
+    best_path = output_dir / f"{args.study_name}_best_params.json"
+    best_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    cmd = "python main.py" +  "".join(f" --{k} {v}" for k, v in study.best_params.items())
+    best_cmd = output_dir / f"{args.study_name}_cmd.sh"
+    with open(best_cmd, "w") as f:
+        f.write(cmd)
+    print(f"Saved best parameter summary to: {best_path}")
 
 
 def main() -> None:
     args = parse_args()
-    args.study_name = f"card_{args.datasets[0]}"
+    validate_args(args)
+    if args.study_name is None:
+        args.study_name = f"card_{args.dataset}"
+
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -415,7 +347,7 @@ def main() -> None:
     if args.dry_run:
         trial = study.ask()
         params = sample_params(trial)
-        command = build_command(args, params, args.datasets[0], parse_seed_list(args.seeds)[0])
+        command = build_command(args, params, parse_seed_list(args.seeds)[0])
         print("Dry-run sampled params:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("Command:")
@@ -423,13 +355,12 @@ def main() -> None:
         return
 
     study.optimize(make_objective(args, output_dir), n_trials=args.n_trials, show_progress_bar=True)
-    save_best(study, output_dir, args)
+    save_best_params(study, output_dir, args)
 
     print("\nBest trial:", study.best_trial.number)
     print("Best value:", study.best_value)
     print("Best params:")
     print(json.dumps(study.best_params, ensure_ascii=False, indent=2, sort_keys=True))
-    print(f"Saved best params to: {output_dir / 'best_params.json'}")
 
 
 if __name__ == "__main__":
